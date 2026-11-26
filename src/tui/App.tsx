@@ -1,5 +1,5 @@
 import React, { useMemo, useState , useEffect} from 'react';
-import { Text, Box } from 'ink';
+import { Text, Box, useInput, useApp } from 'ink';
 import { AgentStatus, ApprovalDecision, ChatMessage } from '../types/chat.js';
 import { ToolCall } from '../types/tool.js';
 import MessageList from './components/MessageList.js';
@@ -36,7 +36,9 @@ export default function App({ agent: propAgent, projectRoot }: AppProps) {
         const unsubscribe = agent.subscribe((state) => {
             setStats(state.stats);
             setModel(state.model);
-            if (projectRoot) {
+            if (!projectRoot) return;
+            const hasConversation = state.messages.some((msg) => msg.role !== 'system');
+            if (hasConversation) {
                 saveSession(projectRoot, state.messages);
             }
         });
@@ -44,6 +46,26 @@ export default function App({ agent: propAgent, projectRoot }: AppProps) {
     }, [agent, projectRoot]);
 
     const isBusy = status === 'thinking' || status === 'executing_tool' || status === 'awaiting_approval';
+
+    const { exit } = useApp();
+
+    useInput((input, key) => {
+        const isCtrlC = key.ctrl && input.toLowerCase() === 'c';
+        const isCancelKey = key.escape || isCtrlC;
+
+        if (!isCancelKey) return;
+
+        if (isBusy) {
+            agent.cancel();
+            setPendingApproval(null);
+            setStreamingSnippet(undefined);
+            return;
+        }
+
+        if (isCtrlC) {
+            exit();
+        }
+    });
     
     let statusText = 'Thinking...';
     if (status === 'awaiting_approval') {
@@ -55,33 +77,62 @@ export default function App({ agent: propAgent, projectRoot }: AppProps) {
     }
 
     const handleSubmit = async (submittedText: string) => {
+        const text = submittedText.trim();
+        if (!text) return; 
+
+        
+        if (/^\/[^\s/]*(\s|$)/.test(text)) {
+            const command = text.split(/\s+/)[0].toLowerCase();
+            setError(undefined);
+
+            switch (command) {
+                case '/exit':
+                case '/quit':
+                    exit();
+                    return; 
+                case '/clear':
+                    setMessages([]);
+                    break;
+                case '/help':
+                    setMessages(prev => [...prev, {
+                        role: 'assistant',
+                        content: 'Available commands:\n/help - Show this message\n/stats - Show session token usage\n/clear - Clear chat history\n/exit or /quit - Exit the application\n\nShortcuts:\nEnter - Send message\nCtrl+C - Exit'
+                    }]);
+                    break;
+                case '/stats': {
+                    const current = agent.getState();
+
+                    setStatsOutput(
+                        [
+                            'Session statistics',
+                            `Model: ${current.model}`,
+                            `Total turns: ${current.stats.totalTurns}`,
+                            `Total API requests: ${current.stats.totalRequests}`,
+                            `Input tokens: ${current.stats.promptTokens}`,
+                            `Output tokens: ${current.stats.completionTokens}`,
+                            `Total tokens: ${current.stats.totalTokens}`,
+                            `Latest request input tokens: ${
+                                current.stats.lastRequestInputTokens ?? 'Unavailable'
+                            }`,
+                            `Model context window: ${
+                                current.stats.contextWindowSize?.toLocaleString('en-US') ?? 'Unavailable'
+                            } tokens`,
+                        ].join('\n')
+                    );
+                    break;
+                }
+                default:
+                    setError(`Unknown command: ${command}. Type /help for available commands.`);
+                    break;
+            }
+
+            setInput('');
+            return;
+        }
+
         setInput('');
         setError(undefined);
         setStreamingSnippet(undefined);
-
-        if (submittedText.trim() === '/stats') {
-            const current = agent.getState();
-
-            setStatsOutput(
-                [
-                    'Session statistics',
-                    `Model: ${current.model}`,
-                    `Total turns: ${current.stats.totalTurns}`,
-                    `Total API requests: ${current.stats.totalRequests}`,
-                    `Input tokens: ${current.stats.promptTokens}`,
-                    `Output tokens: ${current.stats.completionTokens}`,
-                    `Total tokens: ${current.stats.totalTokens}`,
-                    `Latest request input tokens: ${
-                        current.stats.lastRequestInputTokens ?? 'Unavailable'
-                    }`,
-                    `Model context window: ${
-                        current.stats.contextWindowSize?.toLocaleString('en-US') ?? 'Unavailable'
-                    } tokens`,
-                ].join('\n')
-            );
-
-            return;
-        }
 
         setStatsOutput(undefined);
 
@@ -93,7 +144,7 @@ export default function App({ agent: propAgent, projectRoot }: AppProps) {
             }
         };
 
-        for await (const event of agent.run(submittedText, handleChunk)) {
+        for await (const event of agent.run(text, handleChunk)) {
             switch (event.type) {
                 case 'message':
                     setMessages((prev) => [...prev, event.message]);
@@ -162,3 +213,5 @@ export default function App({ agent: propAgent, projectRoot }: AppProps) {
         </Box>
     );
 }
+
+

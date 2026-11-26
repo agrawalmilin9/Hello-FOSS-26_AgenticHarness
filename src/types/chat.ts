@@ -32,6 +32,8 @@ export interface ToolMessage {
     name: string;
     content: string;
     summary?: string; // Human Friendly Summary for the UI
+    added?: number;
+    removed?: number;
 }
 
 export type ChatMessage =
@@ -54,7 +56,11 @@ export interface ChatResponse {
 }
 
 export interface ChatService {
-    chat(messages: ChatMessage[], tools?: Tool[]): Promise<ChatResponse>;
+    chat(
+        messages: ChatMessage[],
+        tools?: Tool[],
+        signal?: AbortSignal
+    ): Promise<ChatResponse>;
 }
 
 export interface SessionStats {

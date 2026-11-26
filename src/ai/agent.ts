@@ -47,6 +47,7 @@ export class Agent {
     };
     private model = config.model;
     private activeToolName?: string;
+    private activeAbortController?: AbortController;
     private error?: string;
     private listeners: Set<AgentListener> = new Set();
 
@@ -57,10 +58,18 @@ export class Agent {
         this.permissionManager = options.permissionManager ?? new SessionPermissionManager();
 
        if (options.initialMessages && options.initialMessages.length > 0) {
-         this.messages = [...options.initialMessages ];
-}      else if (options.systemPrompt) {
-         this.messages.push({ role: 'system', content: options.systemPrompt });
-}
+            const hasSystemMessage = options.initialMessages.some((msg) => msg.role === 'system');
+            if (!hasSystemMessage && options.systemPrompt) {
+                this.messages = [
+                    { role: 'system', content: options.systemPrompt },
+                    ...options.initialMessages,
+                ];
+            } else {
+                this.messages = [...options.initialMessages];
+            }
+        } else if (options.systemPrompt) {
+            this.messages.push({ role: 'system', content: options.systemPrompt });
+        }
     }
 
     public getState(): AgentState {
@@ -101,6 +110,12 @@ export class Agent {
         return this.status === 'thinking' || this.status === 'executing_tool' || this.status === 'awaiting_approval';
     }
 
+    public cancel(): void {
+        if (this.activeAbortController && !this.activeAbortController.signal.aborted) {
+            this.activeAbortController.abort();
+        }
+    }
+
     private needsApproval(toolCall: ToolCall): boolean {
         const tool = this.toolRunner.getTool(toolCall.name);
         if (!tool) return false;
@@ -112,7 +127,10 @@ export class Agent {
         return requires && !this.permissionManager.isPermitted(toolCall.name, toolCall.arguments);
     }
 
-    private async *promptForApproval(toolCall: ToolCall): AsyncGenerator<AgentEvent, ApprovalDecision, void> {
+    private async *promptForApproval(
+        toolCall: ToolCall,
+        signal: AbortSignal
+    ): AsyncGenerator<AgentEvent, ApprovalDecision, void> {
         this.setStatus('awaiting_approval', { activeToolName: toolCall.name });
         yield { type: 'status', status: 'awaiting_approval', activeToolName: toolCall.name };
 
@@ -127,7 +145,27 @@ export class Agent {
             resolve: resolveApproval,
         };
 
-        const decision = await approvalPromise;
+        const decision = await new Promise<ApprovalDecision>((resolve, reject) => {
+            const cleanup = () => {
+                signal.removeEventListener('abort', onAbort);
+            };
+
+            const onAbort = () => {
+                cleanup();
+                reject(new DOMException('Operation cancelled', 'AbortError'));
+            };
+
+            signal.addEventListener('abort', onAbort, { once: true });
+
+            approvalPromise.then((value) => {
+                cleanup();
+                resolve(value);
+            });
+
+            if (signal.aborted) {
+                onAbort();
+            }
+        });
 
         if (decision.approved) {
             if (decision.alwaysAllowSession) {
@@ -161,6 +199,8 @@ export class Agent {
             name: toolCall.name,
             content: result.content,
             summary: result.summary,
+            added: result.added,
+            removed: result.removed,
         };
         this.messages.push(toolMessage);
         return toolMessage;
@@ -200,9 +240,16 @@ private trimHistoryIfNeeded(): void {
     ];
 }
 
-    public async *run(input: string, onChunk?: (chunk: string) => void): AsyncGenerator<AgentEvent> {
+    public async *run(
+        input: string,
+        onChunk?: (chunk: string) => void
+    ): AsyncGenerator<AgentEvent> {
         const trimmed = input.trim();
         if (!trimmed || this.isBusy()) return;
+
+        const controller = new AbortController();
+        const signal = controller.signal;
+        this.activeAbortController = controller;
 
         const userMessage: ChatMessage = { role: 'user', content: trimmed };
         this.messages.push(userMessage);
@@ -217,8 +264,21 @@ private trimHistoryIfNeeded(): void {
             let step = 0;
 
             while (step++ < MAX_STEPS) {
+                if (signal.aborted) {
+                    throw new DOMException('Operation cancelled', 'AbortError');
+                }
+
                 this.trimHistoryIfNeeded();
-                const response: ChatResponse = await this.chatService.chat(this.messages, this.tools);
+
+                const response: ChatResponse = await this.chatService.chat(
+                    this.messages,
+                    this.tools,
+                    signal
+                );
+
+                if (signal.aborted) {
+                    throw new DOMException('Operation cancelled', 'AbortError');
+                }
 
                 this.stats.totalRequests += 1;
                 this.stats.lastRequestInputTokens = response.usage?.promptTokens;
@@ -247,9 +307,13 @@ private trimHistoryIfNeeded(): void {
                 for (const toolCall of response.toolCalls) {
                     yield { type: 'tool_call', toolCall };
 
+                    if (signal.aborted) {
+                        throw new DOMException('Operation cancelled', 'AbortError');
+                    }
+
                     // 1. Human-in-the-loop approval check
                     if (this.needsApproval(toolCall)) {
-                        const decision = yield* this.promptForApproval(toolCall);
+                        const decision = yield* this.promptForApproval(toolCall, signal);
                         if (!decision.approved) {
                             yield* this.handleToolDenial(toolCall, decision.reason);
                             continue;
@@ -260,7 +324,7 @@ private trimHistoryIfNeeded(): void {
                     this.setStatus('executing_tool', { activeToolName: toolCall.name });
                     yield { type: 'status', status: 'executing_tool', activeToolName: toolCall.name };
 
-                    const finalResult = await this.toolRunner.execute(toolCall, onChunk);
+                    const finalResult = await this.toolRunner.execute(toolCall, onChunk, signal);
 
                     // 3. Record tool observation
                     const toolMessage = this.recordToolResult(toolCall, finalResult);
@@ -280,11 +344,34 @@ private trimHistoryIfNeeded(): void {
             this.setStatus('idle');
             yield { type: 'status', status: 'idle' };
             yield { type: 'done' };
-        } catch (err: any) {
-            const errorMessage = err?.message || 'Unknown error occurred';
-            this.setStatus('error', { error: errorMessage });
-            yield { type: 'error', error: errorMessage };
-            yield { type: 'status', status: 'error' };
+        } catch (err: unknown) {
+            if (
+                signal.aborted ||
+                (err instanceof Error && err.name === 'AbortError')
+            ) {
+                const cancellationMessage: ChatMessage = {
+                    role: 'assistant',
+                    content: 'Run cancelled.',
+                };
+
+                this.messages.push(cancellationMessage);
+                yield { type: 'message', message: cancellationMessage };
+
+                this.setStatus('idle');
+                yield { type: 'status', status: 'idle' };
+                yield { type: 'done' };
+            } else {
+                const errorMessage =
+                    err instanceof Error ? err.message : 'Unknown error occurred';
+
+                this.setStatus('error', { error: errorMessage });
+                yield { type: 'error', error: errorMessage };
+                yield { type: 'status', status: 'error' };
+            }
+        } finally {
+            if (this.activeAbortController === controller) {
+                this.activeAbortController = undefined;
+            }
         }
     }
 
